@@ -401,6 +401,9 @@ pub fn run() -> Result<()> {
         return run_headless(&matches, &mut app);
     }
 
+    #[cfg(unix)]
+    spawn_tty_hangup_watchdog();
+
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = ui::setup_terminal(backend)?;
     info!("Terminal UI initialized");
@@ -566,6 +569,51 @@ fn install_signal_handlers() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Force the process to exit when the controlling terminal goes away.
+///
+/// After the terminal is closed the tty reports hangup and `read()` keeps
+/// returning 0. crossterm's `event::poll()` retries that read in a tight loop
+/// and never returns to the UI loop, so `SHUTDOWN_REQUESTED` (set by the SIGHUP
+/// handler) is never looked at and the process spins at 100% CPU. This thread
+/// is independent of the UI loop: it notices the hangup or a pending shutdown
+/// and, if the normal path has not finished within a grace period, exits.
+#[cfg(unix)]
+fn spawn_tty_hangup_watchdog() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    // SAFETY: isatty only inspects the descriptor.
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("tty-watchdog".into())
+        .spawn(|| {
+            let mut triggered: Option<Instant> = None;
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                let mut pfd = libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: 0,
+                    revents: 0,
+                };
+                // SAFETY: pfd is a valid pollfd; zero timeout never blocks.
+                let polled = unsafe { libc::poll(&mut pfd, 1, 0) };
+                let hung_up = polled > 0
+                    && pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+                if hung_up || SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+                    let since = *triggered.get_or_insert_with(Instant::now);
+                    if since.elapsed() > Duration::from_secs(3) {
+                        // SAFETY: nothing left to flush; the terminal is gone
+                        // or the normal shutdown path is stuck.
+                        unsafe { libc::_exit(129) };
+                    }
+                }
+            }
+        });
 }
 
 #[cfg(windows)]
