@@ -4,6 +4,7 @@
 //! can't reach the clipboard daemon. Sandbox-aware on Linux:
 //! reports a more useful error when Landlock has blocked the path.
 
+use std::cell::RefCell;
 use std::time::Instant;
 
 use arboard::Clipboard;
@@ -11,6 +12,31 @@ use log::{error, info};
 
 use crate::app::App;
 use crate::ui::UiState;
+
+thread_local! {
+    /// On Wayland and X11 the clipboard owner has to stay alive to serve
+    /// paste requests; the contents vanish when the `Clipboard` is dropped.
+    /// Keep one instance for the lifetime of the UI thread.
+    static CLIPBOARD: RefCell<Option<Clipboard>> = const { RefCell::new(None) };
+}
+
+fn set_text_persistent(text: &str) -> Result<(), arboard::Error> {
+    CLIPBOARD.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(Clipboard::new()?);
+        }
+        let result = slot
+            .as_mut()
+            .expect("clipboard initialised above")
+            .set_text(text);
+        if result.is_err() {
+            // Reconnect on the next attempt (e.g. compositor restarted).
+            *slot = None;
+        }
+        result
+    })
+}
 
 /// Whether the system clipboard can be reached at all. Landlock's
 /// filesystem and IPC-scope restrictions both sever the path to the display
@@ -36,11 +62,12 @@ pub fn clipboard_available(app: &App) -> bool {
 pub fn copy_to_clipboard(text: &str, display_msg: &str, ui_state: &mut UiState, app: &App) {
     // Only the Linux/FreeBSD error path reads `app`.
     let _ = app;
-    let result = Clipboard::new().and_then(|mut cb| cb.set_text(text));
+    let result = set_text_persistent(text);
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     let result = result.or_else(|_| {
         std::process::Command::new("wl-copy")
+            .arg("--")
             .arg(text)
             .status()
             .map_err(|e| arboard::Error::Unknown {
